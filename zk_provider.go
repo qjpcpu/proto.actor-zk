@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/AsynkronIT/protoactor-go/cluster"
 	"github.com/AsynkronIT/protoactor-go/log"
@@ -19,18 +20,35 @@ var (
 	plog = log.New(log.InfoLevel, "[CLUSTER/ZK]")
 )
 
+type RoleType int
+
+const (
+	Follower RoleType = iota
+	Leader
+)
+
+func (r RoleType) String() string {
+	if r == Leader {
+		return "LEADER"
+	}
+	return "FOLLOWER"
+}
+
 type Provider struct {
-	cluster      *cluster.Cluster
-	baseKey      string
-	clusterName  string
-	deregistered bool
-	shutdown     bool
-	self         *Node
-	members      map[string]*Node // all, contains self.
-	clusterError error
-	conn         *zk.Conn
-	revision     uint64
-	fullpath     string
+	cluster             *cluster.Cluster
+	baseKey             string
+	clusterName         string
+	deregistered        bool
+	shutdown            bool
+	self                *Node
+	members             map[string]*Node // all, contains self.
+	clusterError        error
+	conn                *zk.Conn
+	revision            uint64
+	fullpath            string
+	roleChangedListener RoleChangedListener
+	role                RoleType
+	roleChangedChan     chan RoleType
 }
 
 // New zk cluster provider with config
@@ -52,17 +70,20 @@ func New(endpoints []string, opts ...Option) (*Provider, error) {
 		}
 	}
 	p := &Provider{
-		cluster:      &cluster.Cluster{},
-		baseKey:      zkCfg.BaseKey,
-		clusterName:  "",
-		deregistered: false,
-		shutdown:     false,
-		self:         &Node{},
-		members:      map[string]*Node{},
-		clusterError: err,
-		conn:         conn,
-		revision:     0,
-		fullpath:     "",
+		cluster:             &cluster.Cluster{},
+		baseKey:             zkCfg.BaseKey,
+		clusterName:         "",
+		deregistered:        false,
+		shutdown:            false,
+		self:                &Node{},
+		members:             map[string]*Node{},
+		clusterError:        err,
+		conn:                conn,
+		revision:            0,
+		fullpath:            "",
+		roleChangedListener: zkCfg.RoleChanged,
+		roleChangedChan:     make(chan RoleType, 3),
+		role:                Follower,
 	}
 	return p, nil
 }
@@ -94,22 +115,25 @@ func (p *Provider) StartMember(c *cluster.Cluster) error {
 		return err
 	}
 
+	p.startRoleChangedNotifyLoop()
+
 	// register self
 	if err := p.registerService(); err != nil {
 		plog.Error("register service fail " + err.Error())
 		return err
 	}
-	plog.Info("StartMember regist service.", log.String("node", p.self.ID), log.String("seq", p.self.Meta[metaKeySeq]))
+	plog.Info("StartMember register service.", log.String("node", p.self.ID), log.String("seq", p.self.Meta[metaKeySeq]))
 
-	// fetch memberlist
-	nodes, err := p.fetchNodes()
+	// fetch member list
+	nodes, version, err := p.fetchNodes()
 	if err != nil {
 		plog.Error("fetch nodes fail " + err.Error())
 		return err
 	}
 	// initialize members
-	p.updateNodesWithSelf(nodes)
+	p.updateNodesWithSelf(nodes, version)
 	p.publishClusterTopologyEvent()
+	p.updateLeadership(nodes)
 	p.startWatching(true)
 
 	return nil
@@ -119,12 +143,12 @@ func (p *Provider) StartClient(c *cluster.Cluster) error {
 	if err := p.init(c); err != nil {
 		return err
 	}
-	nodes, err := p.fetchNodes()
+	nodes, version, err := p.fetchNodes()
 	if err != nil {
 		return err
 	}
 	// initialize members
-	p.updateNodes(nodes)
+	p.updateNodes(nodes, version)
 	p.publishClusterTopologyEvent()
 	p.startWatching(false)
 
@@ -134,6 +158,7 @@ func (p *Provider) StartClient(c *cluster.Cluster) error {
 func (p *Provider) Shutdown(graceful bool) error {
 	p.shutdown = true
 	if !p.deregistered {
+		p.updateLeadership(nil)
 		err := p.deregisterService()
 		if err != nil {
 			plog.Error("deregisterMember", log.Error(err))
@@ -218,15 +243,42 @@ func (p *Provider) deregisterService() error {
 
 func (p *Provider) keepWatching(ctx context.Context, registerSelf bool) error {
 	clusterKey := p.buildKey(p.clusterName)
-	_, stat, evtChan, err := p.conn.ChildrenW(clusterKey)
+	evtChan, err := p.addWatcher(ctx, clusterKey)
 	if err != nil {
 		plog.Error("list children fail", log.String("node", clusterKey), log.Error(err))
 		return err
 	}
 
-	plog.Info("KeepWatching cluster.", log.String("cluster", clusterKey), log.Int("children", int(stat.NumChildren)))
-
 	return p._keepWatching(registerSelf, evtChan)
+}
+
+func (p *Provider) addWatcher(ctx context.Context, clusterKey string) (<-chan zk.Event, error) {
+	_, stat, evtChan, err := p.conn.ChildrenW(clusterKey)
+	if err != nil {
+		plog.Error("list children fail", log.String("node", clusterKey), log.Error(err))
+		return nil, err
+	}
+
+	plog.Info("KeepWatching cluster.", log.String("cluster", clusterKey), log.Int("children", int(stat.NumChildren)))
+	if !p.isChildrenChanged(ctx, stat) {
+		return evtChan, nil
+	}
+
+	plog.Info("Chilren changed, wait 1 sec and watch again", log.Int("old_cversion", int(p.revision)), log.Int("new_revison", int(stat.Cversion)))
+	time.Sleep(1 * time.Second)
+	nodes, version, err := p.fetchNodes()
+	if err != nil {
+		return nil, err
+	}
+	// initialize members
+	p.updateNodes(nodes, version)
+	p.publishClusterTopologyEvent()
+	p.updateLeadership(nodes)
+	return p.addWatcher(ctx, clusterKey)
+}
+
+func (p *Provider) isChildrenChanged(ctx context.Context, stat *zk.Stat) bool {
+	return stat.Cversion != int32(p.revision)
 }
 
 func (p *Provider) _keepWatching(registerSelf bool, stream <-chan zk.Event) error {
@@ -239,19 +291,28 @@ func (p *Provider) _keepWatching(registerSelf bool, stream <-chan zk.Event) erro
 		}
 		return err
 	}
-	nodes, err := p.fetchNodes()
+	nodes, version, err := p.fetchNodes()
 	if err != nil {
 		plog.Error("Failure fetch nodes when watching service.", log.Error(err))
 		return err
 	}
 	if !p.containSelf(nodes) && registerSelf {
-		nodes = append(nodes, p.self)
+		// i am lost, register self
 		if err = p.registerService(); err != nil {
 			return err
 		}
+		// reload nodes
+		nodes, version, err = p.fetchNodes()
+		if err != nil {
+			plog.Error("Failure fetch nodes when watching service.", log.Error(err))
+			return err
+		}
 	}
-	p.updateNodesWithChanges(nodes)
+	p.updateNodes(nodes, version)
 	p.publishClusterTopologyEvent()
+	if registerSelf {
+		p.updateLeadership(nodes)
+	}
 
 	return nil
 }
@@ -269,6 +330,44 @@ func (p *Provider) containSelf(ns []*Node) bool {
 	for _, node := range ns {
 		if p.self != nil && node.ID == p.self.ID {
 			return true
+		}
+	}
+	return false
+}
+
+func (p *Provider) startRoleChangedNotifyLoop() {
+	go func() {
+		for !p.shutdown {
+			role := <-p.roleChangedChan
+			if lis := p.roleChangedListener; lis != nil {
+				safeRun(func() { lis.OnRoleChanged(role) })
+			}
+		}
+	}()
+}
+
+func (p *Provider) updateLeadership(ns []*Node) {
+	role := Follower
+	if p.isLeaderOf(ns) {
+		role = Leader
+	}
+	if role != p.role {
+		plog.Info("Role changed.", log.String("from", p.role.String()), log.String("to", role.String()))
+		p.roleChangedChan <- role
+	}
+	p.role = role
+}
+
+func (p *Provider) isLeaderOf(ns []*Node) bool {
+	var minSeq int
+	for _, node := range ns {
+		if seq := node.GetSeq(); (seq > 0 && seq < minSeq) || minSeq == 0 {
+			minSeq = seq
+		}
+	}
+	for _, node := range ns {
+		if p.self != nil && node.ID == p.self.ID {
+			return minSeq > 0 && minSeq == p.self.GetSeq()
 		}
 	}
 	return false
@@ -295,53 +394,54 @@ func (p *Provider) buildKey(names ...string) string {
 	return filepath.Join(append([]string{p.baseKey}, names...)...)
 }
 
-func (p *Provider) fetchNodes() ([]*Node, error) {
+func (p *Provider) fetchNodes() ([]*Node, int32, error) {
 	key := p.buildKey(p.clusterName)
 	children, stat, err := p.conn.Children(key)
 	if err != nil {
 		plog.Error("FetchNodes fail.", log.String("node", key), log.Error(err))
-		return nil, err
+		return nil, 0, err
 	}
 
-	nodes := []*Node{}
-	for _, v := range children {
-		v = filepath.Join(key, v)
-		value, _, err := p.conn.Get(v)
+	var nodes []*Node
+	for _, short := range children {
+		long := filepath.Join(key, short)
+		value, _, err := p.conn.Get(long)
 		if err != nil {
-			plog.Error("FetchNodes fail.", log.String("node", v), log.Error(err))
-			return nil, err
+			plog.Error("FetchNodes fail.", log.String("node", long), log.Error(err))
+			return nil, stat.Cversion, err
 		}
 		n := Node{Meta: make(map[string]string)}
 		if err := n.Deserialize(value); err != nil {
-			plog.Error("FetchNodes Deserialize fail.", log.String("node", v), log.String("val", string(value)), log.Error(err))
-			return nil, err
+			plog.Error("FetchNodes Deserialize fail.", log.String("node", long), log.String("val", string(value)), log.Error(err))
+			return nil, stat.Cversion, err
 		}
-		seq, err := parseSeq(v)
+		seq, err := parseSeq(long)
 		if err != nil {
-			plog.Error("FetchNodes parse seq fail.", log.String("node", v), log.String("val", string(value)), log.Error(err))
+			plog.Error("FetchNodes parse seq fail.", log.String("node", long), log.String("val", string(value)), log.Error(err))
 		} else {
 			n.SetMeta(metaKeySeq, intToStr(seq))
 		}
-		plog.Info("FetchNodes new node.", log.String("id", n.ID), log.String("path", v), log.Int("seq", seq))
+		plog.Info("FetchNodes new node.", log.String("id", n.ID), log.String("path", long), log.Int("seq", seq))
 		nodes = append(nodes, &n)
 	}
-	p.revision = uint64(stat.Cversion)
-	return p.uniqNodes(nodes), nil
+	return p.uniqNodes(nodes), stat.Cversion, nil
 }
 
-func (p *Provider) updateNodes(members []*Node) {
+func (p *Provider) updateNodes(members []*Node, reversion int32) {
 	nm := make(map[string]*Node)
 	for _, n := range members {
 		nm[n.ID] = n
 	}
 	p.members = nm
+	p.revision = uint64(reversion)
 }
 
 func (p *Provider) uniqNodes(nodes []*Node) []*Node {
 	nodeMap := make(map[string]*Node)
 	for _, node := range nodes {
 		if n, ok := nodeMap[node.GetAddressString()]; ok {
-			if strToInt(node.Meta[metaKeySeq]) > strToInt(n.Meta[metaKeySeq]) {
+			// keep node with higher version
+			if node.GetSeq() > n.GetSeq() {
 				nodeMap[node.GetAddressString()] = node
 			}
 		} else {
@@ -356,17 +456,9 @@ func (p *Provider) uniqNodes(nodes []*Node) []*Node {
 	return out
 }
 
-func (p *Provider) updateNodesWithSelf(members []*Node) {
-	p.updateNodes(members)
+func (p *Provider) updateNodesWithSelf(members []*Node, version int32) {
+	p.updateNodes(members, version)
 	p.members[p.self.ID] = p.self
-}
-
-func (p *Provider) updateNodesWithChanges(changes []*Node) {
-	nodeMap := make(map[string]*Node)
-	for _, node := range changes {
-		nodeMap[node.ID] = node
-	}
-	p.members = nodeMap
 }
 
 func (p *Provider) createClusterTopologyEvent() cluster.TopologyEvent {

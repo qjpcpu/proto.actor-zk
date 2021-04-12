@@ -68,6 +68,13 @@ func (n *Node) GetMeta(name string) (string, bool) {
 	return val, ok
 }
 
+func (n *Node) GetSeq() int {
+	if seqStr, ok := n.GetMeta(metaKeySeq); ok {
+		return strToInt(seqStr)
+	}
+	return 0
+}
+
 func (n *Node) MemberStatus() *cluster.Member {
 	host, port := n.GetAddress()
 	kinds := n.Kinds

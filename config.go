@@ -33,6 +33,13 @@ func WithSessionTimeout(tm time.Duration) Option {
 	}
 }
 
+// WithRoleChangedListener triggered on self role changed
+func WithRoleChangedListener(l RoleChangedListener) Option {
+	return func(o *config) {
+		o.RoleChanged = l
+	}
+}
+
 func withEndpoints(e []string) Option {
 	return func(o *config) {
 		o.Endpoints = e
@@ -48,11 +55,16 @@ func (za authConfig) isEmpty() bool {
 	return za.Scheme == "" && za.Credential == ""
 }
 
+type RoleChangedListener interface {
+	OnRoleChanged(RoleType)
+}
+
 type config struct {
 	BaseKey        string
 	Endpoints      []string
 	SessionTimeout time.Duration
 	Auth           authConfig
+	RoleChanged    RoleChangedListener
 }
 
 func defaultConfig() *config {
