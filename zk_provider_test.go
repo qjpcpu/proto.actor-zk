@@ -46,7 +46,7 @@ func TestStartMember(t *testing.T) {
 	p, _ := NewZkProvider()
 	defer p.Shutdown(true)
 
-	c := newClusterForTest("test_etcd_provider", "127.0.0.1:8000", p)
+	c := newClusterForTest("test_zk_provider", "127.0.0.1:8000", p)
 	eventstream := c.ActorSystem.EventStream
 	ch := make(chan interface{}, 16)
 	eventstream.Subscribe(func(m interface{}) {
@@ -67,7 +67,7 @@ func TestStartMember(t *testing.T) {
 		msg := m.(*cluster.ClusterTopologyEventV2)
 		members := []*cluster.Member{
 			{
-				Id:    "test_etcd_provider@127.0.0.1:8000",
+				Id:    "test_zk_provider@127.0.0.1:8000",
 				Host:  "127.0.0.1",
 				Port:  8000,
 				Kinds: []string{},
@@ -125,7 +125,7 @@ func TestStartMember_Multiple(t *testing.T) {
 		return false
 	}
 	for i := range p {
-		nodes, err := p[i].fetchNodes()
+		nodes, _, err := p[i].fetchNodes()
 		assert.NoError(err)
 		assert.Equal(len(members), len(nodes))
 		flag := isNodesEqual(nodes)
