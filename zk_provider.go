@@ -376,6 +376,9 @@ func (p *Provider) onEvent(evt zk.Event) {
 }
 
 func (p *Provider) isLeaderOf(ns []*Node) bool {
+	if len(ns) == 1 && p.self != nil && ns[0].ID == p.self.ID {
+		return true
+	}
 	var minSeq int
 	for _, node := range ns {
 		if seq := node.GetSeq(); (seq > 0 && seq < minSeq) || minSeq == 0 {
