@@ -89,6 +89,10 @@ func New(endpoints []string, opts ...Option) (*Provider, error) {
 	return p, nil
 }
 
+func (p *Provider) IsLeader() bool {
+	return p.role == Leader
+}
+
 func (p *Provider) init(c *cluster.Cluster) error {
 	p.cluster = c
 	addr := p.cluster.ActorSystem.Address()
@@ -354,9 +358,9 @@ func (p *Provider) updateLeadership(ns []*Node) {
 	}
 	if role != p.role {
 		plog.Info("Role changed.", log.String("from", p.role.String()), log.String("to", role.String()))
+		p.role = role
 		p.roleChangedChan <- role
 	}
-	p.role = role
 }
 
 func (p *Provider) onEvent(evt zk.Event) {
