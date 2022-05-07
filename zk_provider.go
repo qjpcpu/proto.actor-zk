@@ -2,8 +2,6 @@ package zk
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -16,10 +14,7 @@ import (
 	"github.com/go-zookeeper/zk"
 )
 
-var (
-	_    cluster.ClusterProvider = new(Provider)
-	plog                         = log.New(log.InfoLevel, "[CLU/ZK]")
-)
+var _ cluster.ClusterProvider = new(Provider)
 
 type RoleType int
 
@@ -91,6 +86,10 @@ func New(endpoints []string, opts ...Option) (*Provider, error) {
 
 func (p *Provider) IsLeader() bool {
 	return p.role == Leader
+}
+
+func (p *Provider) UpdateClusterState(state cluster.ClusterState) error {
+	return nil
 }
 
 func (p *Provider) init(c *cluster.Cluster) error {
@@ -174,19 +173,6 @@ func (p *Provider) Shutdown(graceful bool) error {
 	return nil
 }
 
-func (p *Provider) UpdateClusterState(state cluster.ClusterState) error {
-	if p.shutdown {
-		return fmt.Errorf("shutdowned")
-	}
-	data, err := json.Marshal(state)
-	if err != nil {
-		return err
-	}
-	value := base64.StdEncoding.EncodeToString(data)
-	p.self.SetMeta("state", value)
-	return p.registerService()
-}
-
 func (p *Provider) getID() string {
 	return p.self.ID
 }
@@ -258,6 +244,7 @@ func (p *Provider) keepWatching(ctx context.Context, registerSelf bool) error {
 }
 
 func (p *Provider) addWatcher(ctx context.Context, clusterKey string) (<-chan zk.Event, error) {
+	plog.Info("Adding watcher.", log.String("cluster", clusterKey))
 	_, stat, evtChan, err := p.conn.ChildrenW(clusterKey)
 	if err != nil {
 		plog.Error("list children fail", log.String("node", clusterKey), log.Error(err))
@@ -283,18 +270,29 @@ func (p *Provider) addWatcher(ctx context.Context, clusterKey string) (<-chan zk
 }
 
 func (p *Provider) isChildrenChanged(ctx context.Context, stat *zk.Stat) bool {
-	return stat.Cversion != int32(p.revision)
+	return stat.Cversion != int32(p.revision) || len(p.members) != int(stat.NumChildren)
 }
 
 func (p *Provider) _keepWatching(registerSelf bool, stream <-chan zk.Event) error {
-	event := <-stream
-	if err := event.Err; err != nil {
-		plog.Error("Failure watching service.", log.Error(err))
-		if registerSelf && p.clusterNotContainsSelfPath() {
-			plog.Info("Register info lost, register self again")
-			p.registerService()
+WATCH_LOOP:
+	for {
+		select {
+		case event := <-stream:
+			if err := event.Err; err != nil {
+				plog.Error("Failure watching service.", log.Error(err))
+				if registerSelf && p.clusterNotContainsSelfPath() {
+					plog.Info("Register info lost, register self again")
+					p.registerService()
+				}
+				return err
+			}
+		case <-time.After(time.Second * 30):
+			key := p.buildKey(p.clusterName)
+			children, stat, err := p.conn.Children(key)
+			if err != nil || len(p.members) != int(stat.NumChildren) || len(p.members) != len(children) {
+				break WATCH_LOOP
+			}
 		}
-		return err
 	}
 	nodes, version, err := p.fetchNodes()
 	if err != nil {
@@ -328,7 +326,6 @@ func (p *Provider) clusterNotContainsSelfPath() bool {
 	return err == nil && !stringContains(mapString(children, func(s string) string {
 		return filepath.Join(clusterKey, s)
 	}), p.fullpath)
-
 }
 
 func (p *Provider) containSelf(ns []*Node) bool {
@@ -485,8 +482,8 @@ func (p *Provider) updateNodesWithSelf(members []*Node, version int32) {
 	p.members[p.self.ID] = p.self
 }
 
-func (p *Provider) createClusterTopologyEvent() cluster.TopologyEvent {
-	res := make(cluster.TopologyEvent, len(p.members))
+func (p *Provider) createClusterTopologyEvent() []*cluster.Member {
+	res := make([]*cluster.Member, len(p.members))
 	i := 0
 	for _, m := range p.members {
 		res[i] = m.MemberStatus()
